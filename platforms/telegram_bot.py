@@ -1,8 +1,9 @@
 import asyncio
 import json
 import logging
+import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction, ParseMode
@@ -30,14 +31,17 @@ logger = logging.getLogger(__name__)
 class ChatState:
     """State for a single Telegram chat."""
     session_id: str
-    project_dir_name: str | None = None  # e.g. "-Users-foo-Desktop-myproject"
-    working_directory: str | None = None  # e.g. "/Users/foo/Desktop/myproject"
+    project_dir_name: str | None = None
+    working_directory: str | None = None
 
 
 _chat_states: dict[int, ChatState] = {}
 
 # Pending permission requests: callback_id -> dict
 _pending_permissions: dict[str, dict] = {}
+
+# Temporary storage for callback data (projects/sessions lists)
+_callback_data: dict[str, dict] = {}
 
 
 def _get_state(chat_id: int, config: Config) -> ChatState:
@@ -72,6 +76,202 @@ def _format_denials(denials: list[PermissionDenial]) -> str:
     return "\n".join(lines)
 
 
+def _short_path(path: str) -> str:
+    """Shorten a path for button labels: /Users/foo/Desktop/myproject -> ~/Desktop/myproject"""
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+# ---- Onboarding & project/session buttons -----------------------------------
+
+async def _send_onboarding(chat_id: int, config: Config, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send welcome message with project selection buttons."""
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "Welcome to Claude Remote!\n\n"
+            "I bridge your Telegram to Claude Code running on your machine. "
+            "You can chat with Claude, browse projects, and resume terminal sessions.\n\n"
+            "Let's start by picking a project:"
+        ),
+    )
+    await _send_project_buttons(chat_id, config, context)
+
+
+async def _send_project_buttons(chat_id: int, config: Config, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send inline keyboard with project buttons."""
+    projects = list_projects(config.claude_projects_dir)
+    if not projects:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="No Claude Code projects found. Send a message to start a new conversation.",
+        )
+        return
+
+    # Store projects for callback resolution
+    cb_id = str(uuid.uuid4())[:8]
+    _callback_data[cb_id] = {"type": "projects", "projects": projects}
+
+    # Build button grid (1 project per row, max 8)
+    buttons = []
+    for i, p in enumerate(projects[:8]):
+        label = _short_path(p.real_path)
+        buttons.append([InlineKeyboardButton(
+            f"{label}  ({p.session_count} sessions)",
+            callback_data=f"proj:{cb_id}:{i}",
+        )])
+
+    if len(projects) > 8:
+        buttons.append([InlineKeyboardButton(
+            f"Show all ({len(projects)} projects)...",
+            callback_data=f"proj:{cb_id}:more",
+        )])
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Select a project:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _send_session_buttons(
+    chat_id: int, config: Config, project_dir_name: str,
+    working_directory: str, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Send inline keyboard with session buttons for a project."""
+    sessions = list_sessions(config.claude_projects_dir, project_dir_name)
+
+    cb_id = str(uuid.uuid4())[:8]
+    _callback_data[cb_id] = {"type": "sessions", "sessions": sessions}
+
+    buttons = []
+
+    # "New conversation" first
+    buttons.append([InlineKeyboardButton(
+        "New conversation",
+        callback_data=f"sess:{cb_id}:new",
+    )])
+
+    if sessions:
+        for i, s in enumerate(sessions[:6]):
+            ts = s.timestamp[:16].replace("T", " ") if s.timestamp else "?"
+            preview = s.first_message[:40]
+            if len(s.first_message) > 40:
+                preview += "..."
+            buttons.append([InlineKeyboardButton(
+                f"{preview}  [{ts}]",
+                callback_data=f"sess:{cb_id}:{i}",
+            )])
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Project: {_short_path(working_directory)}\n\nResume a session or start new:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ---- Callback handlers for buttons ------------------------------------------
+
+async def handle_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle project selection button press."""
+    query = update.callback_query
+    await query.answer()
+
+    config: Config = context.bot_data["config"]
+    chat_id = query.message.chat_id
+
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        return
+
+    _, cb_id, selection = parts
+    cb_data = _callback_data.pop(cb_id, None)
+    if not cb_data or cb_data["type"] != "projects":
+        await query.edit_message_text("This selection has expired. Use /projects.")
+        return
+
+    projects = cb_data["projects"]
+    state = _get_state(chat_id, config)
+
+    if selection == "more":
+        # Show all projects as text list
+        _callback_data[cb_id] = cb_data  # re-store
+        lines = ["All projects:\n"]
+        for i, p in enumerate(projects, 1):
+            lines.append(f"{i}. {_short_path(p.real_path)}  ({p.session_count} sessions)")
+        lines.append("\nUse /cd <number> to switch.")
+        context.chat_data["project_list"] = projects
+        await query.edit_message_text("\n".join(lines))
+        return
+
+    try:
+        idx = int(selection)
+    except ValueError:
+        return
+
+    if 0 <= idx < len(projects):
+        p = projects[idx]
+        state.project_dir_name = p.dir_name
+        state.working_directory = p.real_path
+        state.session_id = str(uuid.uuid4())
+
+        await query.edit_message_text(f"Selected: {_short_path(p.real_path)}")
+
+        # Now show sessions for this project
+        await _send_session_buttons(chat_id, config, p.dir_name, p.real_path, context)
+
+
+async def handle_session_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle session selection button press."""
+    query = update.callback_query
+    await query.answer()
+
+    config: Config = context.bot_data["config"]
+    chat_id = query.message.chat_id
+
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        return
+
+    _, cb_id, selection = parts
+    cb_data = _callback_data.pop(cb_id, None)
+    if not cb_data or cb_data["type"] != "sessions":
+        await query.edit_message_text("This selection has expired. Use /sessions.")
+        return
+
+    sessions = cb_data["sessions"]
+    state = _get_state(chat_id, config)
+
+    if selection == "new":
+        state.session_id = str(uuid.uuid4())
+        claude_executor._created_sessions.discard(state.session_id)
+        await query.edit_message_text(
+            "New conversation started.\n\n"
+            "Send a message to chat with Claude."
+        )
+        return
+
+    try:
+        idx = int(selection)
+    except ValueError:
+        return
+
+    if 0 <= idx < len(sessions):
+        s = sessions[idx]
+        state.session_id = s.session_id
+        claude_executor._created_sessions.add(s.session_id)
+        if s.cwd:
+            state.working_directory = s.cwd
+
+        await query.edit_message_text(
+            f"Resumed: \"{s.first_message[:60]}\"\n"
+            f"Session: {s.session_id[:8]}...\n\n"
+            "Send a message to continue."
+        )
+
+
 # ---- Command handlers -------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -80,19 +280,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("You are not authorized to use this bot.")
         return
 
-    await update.message.reply_text(
-        "Hello! I'm a bridge to Claude Code on your machine.\n\n"
-        "Commands:\n"
-        "/projects - List all Claude Code projects\n"
-        "/cd <project> - Switch to a project\n"
-        "/sessions - List sessions in current project\n"
-        "/resume <id> - Resume an existing session\n"
-        "/new - Start a new conversation\n"
-        "/model <name> - Switch Claude model\n"
-        "/budget <amount> - Set max budget in USD\n"
-        "/status - Show current state\n\n"
-        "Or just send a message to chat with Claude!"
-    )
+    chat_id = update.effective_chat.id
+    await _send_onboarding(chat_id, config, context)
 
 
 async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -100,20 +289,7 @@ async def cmd_projects(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not _is_allowed(update.effective_user.id, config):
         return
 
-    projects = list_projects(config.claude_projects_dir)
-    if not projects:
-        await update.message.reply_text("No Claude Code projects found.")
-        return
-
-    lines = ["Projects:\n"]
-    for i, p in enumerate(projects, 1):
-        lines.append(f"{i}. {p.real_path}  ({p.session_count} sessions)")
-
-    lines.append("\nUse /cd <number> or /cd <path> to switch.")
-    await update.message.reply_text("\n".join(lines))
-
-    # Store project list for /cd by number
-    context.chat_data["project_list"] = projects
+    await _send_project_buttons(update.effective_chat.id, config, context)
 
 
 async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -124,17 +300,14 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         state = _get_state(update.effective_chat.id, config)
         cwd = state.working_directory or "not set"
-        project = state.project_dir_name or "none"
-        await update.message.reply_text(
-            f"Current directory: {cwd}\nProject: {project}\n\n"
-            "Usage: /cd <number> (from /projects list) or /cd <path>"
-        )
+        await update.message.reply_text(f"Current directory: {cwd}")
+        await _send_project_buttons(update.effective_chat.id, config, context)
         return
 
     arg = " ".join(context.args)
     projects = list_projects(config.claude_projects_dir)
 
-    # Try as a number (index into project list)
+    # Try as a number
     try:
         idx = int(arg) - 1
         project_list = context.chat_data.get("project_list", projects)
@@ -143,9 +316,11 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             state = _get_state(update.effective_chat.id, config)
             state.project_dir_name = p.dir_name
             state.working_directory = p.real_path
-            state.session_id = str(uuid.uuid4())  # fresh session for new project
-            claude_executor._created_sessions.discard(state.session_id)
-            await update.message.reply_text(f"Switched to: {p.real_path}")
+            state.session_id = str(uuid.uuid4())
+            await update.message.reply_text(f"Switched to: {_short_path(p.real_path)}")
+            await _send_session_buttons(
+                update.effective_chat.id, config, p.dir_name, p.real_path, context
+            )
             return
         else:
             await update.message.reply_text(f"Invalid number. Use 1-{len(project_list)}.")
@@ -153,15 +328,17 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except ValueError:
         pass
 
-    # Try as a path — find matching project
+    # Try as a path match
     for p in projects:
         if arg in p.real_path or arg in p.dir_name:
             state = _get_state(update.effective_chat.id, config)
             state.project_dir_name = p.dir_name
             state.working_directory = p.real_path
             state.session_id = str(uuid.uuid4())
-            claude_executor._created_sessions.discard(state.session_id)
-            await update.message.reply_text(f"Switched to: {p.real_path}")
+            await update.message.reply_text(f"Switched to: {_short_path(p.real_path)}")
+            await _send_session_buttons(
+                update.effective_chat.id, config, p.dir_name, p.real_path, context
+            )
             return
 
     await update.message.reply_text(f"Project not found: {arg}")
@@ -175,30 +352,14 @@ async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     state = _get_state(update.effective_chat.id, config)
 
     if not state.project_dir_name:
-        await update.message.reply_text(
-            "No project selected. Use /projects and /cd first."
-        )
+        await update.message.reply_text("No project selected.")
+        await _send_project_buttons(update.effective_chat.id, config, context)
         return
 
-    sessions = list_sessions(config.claude_projects_dir, state.project_dir_name)
-    if not sessions:
-        await update.message.reply_text("No sessions found in this project.")
-        return
-
-    lines = [f"Sessions in {state.working_directory}:\n"]
-    for i, s in enumerate(sessions, 1):
-        ts = s.timestamp[:16].replace("T", " ") if s.timestamp else "?"
-        preview = s.first_message[:60]
-        if len(s.first_message) > 60:
-            preview += "..."
-        lines.append(f"{i}. [{ts}] ({s.message_count} msgs)")
-        lines.append(f"   \"{preview}\"")
-        lines.append(f"   /resume_{s.session_id[:8]}")
-
-    await update.message.reply_text("\n".join(lines))
-
-    # Store for /resume by number
-    context.chat_data["session_list"] = sessions
+    await _send_session_buttons(
+        update.effective_chat.id, config,
+        state.project_dir_name, state.working_directory, context,
+    )
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -207,78 +368,76 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if not context.args:
-        await update.message.reply_text(
-            "Usage: /resume <session-id> or /resume <number> (from /sessions list)"
-        )
+        # No args: show session buttons if project is selected
+        state = _get_state(update.effective_chat.id, config)
+        if state.project_dir_name:
+            await _send_session_buttons(
+                update.effective_chat.id, config,
+                state.project_dir_name, state.working_directory, context,
+            )
+        else:
+            await update.message.reply_text(
+                "Usage: /resume <session-id> or select a project first with /projects"
+            )
         return
 
     arg = context.args[0]
     state = _get_state(update.effective_chat.id, config)
 
-    # Try as a number (index from /sessions list)
+    # Try as a number
     try:
         idx = int(arg) - 1
         session_list = context.chat_data.get("session_list", [])
         if 0 <= idx < len(session_list):
             s = session_list[idx]
             state.session_id = s.session_id
-            claude_executor._created_sessions.add(s.session_id)  # mark as existing
+            claude_executor._created_sessions.add(s.session_id)
             if s.cwd:
                 state.working_directory = s.cwd
             await update.message.reply_text(
-                f"Resumed session: {s.session_id[:8]}...\n"
-                f"First message: \"{s.first_message[:60]}\"\n"
-                f"Working dir: {state.working_directory}"
+                f"Resumed: \"{s.first_message[:60]}\"\n"
+                f"Session: {s.session_id[:8]}...\n"
+                f"Working dir: {_short_path(state.working_directory)}"
             )
-            return
-        else:
-            await update.message.reply_text(f"Invalid number. Use 1-{len(session_list)}.")
             return
     except ValueError:
         pass
 
     # Try as session ID (full or prefix)
     session_id = arg
+    if len(session_id) < 36 and state.project_dir_name:
+        sessions = list_sessions(config.claude_projects_dir, state.project_dir_name, limit=50)
+        for s in sessions:
+            if s.session_id.startswith(session_id):
+                session_id = s.session_id
+                break
 
-    # If it's a short prefix, try to find the full ID
-    if len(session_id) < 36:
-        # Search in current project first
-        if state.project_dir_name:
-            sessions = list_sessions(config.claude_projects_dir, state.project_dir_name, limit=50)
-            for s in sessions:
-                if s.session_id.startswith(session_id):
-                    session_id = s.session_id
-                    break
-
-    # Try to find the session globally
     found = find_session(config.claude_projects_dir, session_id)
     if found:
         project_dir_name, cwd = found
         state.session_id = session_id
         state.project_dir_name = project_dir_name
         state.working_directory = cwd
-        claude_executor._created_sessions.add(session_id)  # mark as existing
+        claude_executor._created_sessions.add(session_id)
         await update.message.reply_text(
             f"Resumed session: {session_id[:8]}...\n"
-            f"Working dir: {cwd}"
+            f"Working dir: {_short_path(cwd)}"
         )
     else:
         await update.message.reply_text(f"Session not found: {session_id}")
 
 
 async def cmd_resume_shortcut(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /resume_<short_id> shortcuts from /sessions output."""
+    """Handle /resume_<short_id> shortcuts."""
     config: Config = context.bot_data["config"]
     if not _is_allowed(update.effective_user.id, config):
         return
 
-    # Extract session ID prefix from command like /resume_e520e26e
     cmd_text = update.message.text
     prefix = cmd_text.split("_", 1)[1] if "_" in cmd_text else ""
     if not prefix:
         return
 
-    # Simulate /resume with this prefix
     context.args = [prefix]
     await cmd_resume(update, context)
 
@@ -334,17 +493,60 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     state = _get_state(update.effective_chat.id, config)
-    project = state.project_dir_name or "none"
-    cwd = state.working_directory or "not set"
+    cwd = _short_path(state.working_directory) if state.working_directory else "not set"
     sid = state.session_id[:8] + "..."
 
-    await update.message.reply_text(
-        f"Project: {project}\n"
-        f"Working dir: {cwd}\n"
-        f"Session: {sid}\n"
-        f"Model: {config.claude_model}\n"
-        f"Budget: {config.claude_max_budget or 'not set'}"
-    )
+    lines = [
+        f"Project: {cwd}",
+        f"Session: {sid}",
+        f"Model: {config.claude_model}",
+        f"Budget: {config.claude_max_budget or 'not set'}",
+    ]
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Switch project", callback_data="nav:projects"),
+            InlineKeyboardButton("Switch session", callback_data="nav:sessions"),
+        ],
+        [
+            InlineKeyboardButton("New conversation", callback_data="nav:new"),
+        ],
+    ])
+
+    await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
+
+
+# ---- Navigation callback (from /status buttons) -----------------------------
+
+async def handle_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    config: Config = context.bot_data["config"]
+    chat_id = query.message.chat_id
+
+    action = query.data.split(":")[1]
+
+    if action == "projects":
+        await query.edit_message_text("Select a project:")
+        await _send_project_buttons(chat_id, config, context)
+
+    elif action == "sessions":
+        state = _get_state(chat_id, config)
+        if state.project_dir_name:
+            await query.edit_message_text("Select a session:")
+            await _send_session_buttons(
+                chat_id, config, state.project_dir_name, state.working_directory, context
+            )
+        else:
+            await query.edit_message_text("No project selected. Pick one first:")
+            await _send_project_buttons(chat_id, config, context)
+
+    elif action == "new":
+        state = _get_state(chat_id, config)
+        claude_executor._created_sessions.discard(state.session_id)
+        state.session_id = str(uuid.uuid4())
+        await query.edit_message_text("New conversation started. Send a message!")
 
 
 # ---- Message handler ---------------------------------------------------------
@@ -378,11 +580,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = update.effective_chat.id
     state = _get_state(chat_id, config)
+
+    # No project selected: show onboarding
+    if not state.project_dir_name:
+        await _send_onboarding(chat_id, config, context)
+        return
+
     cwd = state.working_directory or config.default_working_directory
 
     logger.info("User %s (chat %s) sent: %s", user_id, chat_id, prompt[:80])
 
-    # Show typing indicator
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     typing_task = asyncio.ensure_future(_keep_typing(context.bot, chat_id))
@@ -455,7 +662,6 @@ async def handle_permission_callback(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("Permission denied.")
         return
 
-    # Approved
     chat_id = pending["chat_id"]
     session_id = pending["session_id"]
     working_directory = pending["working_directory"]
@@ -501,6 +707,7 @@ def create_app(config: Config) -> Application:
     app = Application.builder().token(config.telegram_bot_token).build()
     app.bot_data["config"] = config
 
+    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("cd", cmd_cd))
@@ -510,11 +717,19 @@ def create_app(config: Config) -> Application:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("budget", cmd_budget))
     app.add_handler(CommandHandler("status", cmd_status))
+
+    # Button callbacks
+    app.add_handler(CallbackQueryHandler(handle_project_callback, pattern=r"^proj:"))
+    app.add_handler(CallbackQueryHandler(handle_session_callback, pattern=r"^sess:"))
     app.add_handler(CallbackQueryHandler(handle_permission_callback, pattern=r"^perm_"))
-    # Handle /resume_<id> shortcut commands
+    app.add_handler(CallbackQueryHandler(handle_nav_callback, pattern=r"^nav:"))
+
+    # /resume_<id> shortcut
     app.add_handler(MessageHandler(
         filters.Regex(r"^/resume_[a-f0-9]+"), cmd_resume_shortcut
     ))
+
+    # Regular messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     return app
