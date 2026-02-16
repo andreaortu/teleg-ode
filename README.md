@@ -1,4 +1,4 @@
-# claude-remote
+# teleg-ode
 
 A self-hosted Telegram bot that lets you interact with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) from your phone. Messages from Telegram are piped to the `claude` CLI running on your machine, and responses are sent back.
 
@@ -9,7 +9,7 @@ Your Phone (Telegram)
   Telegram Bot API (polling)
         │
         ▼
-  claude-remote (Python, on your machine)
+  teleg-ode (Python, on your machine)
         │
         ▼
   claude CLI  (claude -p --output-format stream-json)
@@ -20,6 +20,7 @@ Your Phone (Telegram)
 - **Multi-project support** — browse all your Claude Code projects and switch between them
 - **Session continuity** — resume any existing Claude Code session from Telegram, or start from the terminal and pick up on your phone
 - **Permission handling** — when Claude needs to write files or run commands, you get Approve/Deny buttons on Telegram
+- **Interactive onboarding** — inline buttons for project and session selection, no commands to memorize
 - **Conversation memory** — each chat maintains its own session; use `/new` to start fresh
 - **Message splitting** — long responses are automatically split at paragraph boundaries
 
@@ -34,7 +35,7 @@ Your Phone (Telegram)
 ### 2. Install
 
 ```bash
-git clone <repo-url> && cd claude-remote
+git clone https://github.com/andreaortu/teleg-ode.git && cd teleg-ode
 pip install -r requirements.txt
 cp .env.example .env
 ```
@@ -70,7 +71,7 @@ The bot uses **polling** (outbound HTTPS only) — no need for ngrok or public U
 
 | Command | Description |
 |---|---|
-| `/start` | Welcome message and command list |
+| `/start` | Welcome message and project selection |
 | `/projects` | List all Claude Code projects on your machine |
 | `/cd <number\|path>` | Switch active project |
 | `/sessions` | List recent sessions in the current project |
@@ -103,7 +104,7 @@ When Claude needs to write a file or run a command, the bot sends a message show
 ## Project structure
 
 ```
-claude-remote/
+teleg-ode/
 ├── main.py               # Entry point
 ├── config.py             # Configuration from .env
 ├── claude_executor.py    # Subprocess wrapper for claude CLI

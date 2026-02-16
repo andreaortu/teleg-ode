@@ -28,7 +28,7 @@ def main() -> None:
         )
         sys.exit(1)
 
-    logger.info("Starting claude-remote Telegram bot...")
+    logger.info("Starting teleg-ode Telegram bot...")
     logger.info("Projects dir: %s", config.claude_projects_dir)
     logger.info("Default working dir: %s", config.default_working_directory)
     logger.info("Model: %s", config.claude_model)

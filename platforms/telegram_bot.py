@@ -91,7 +91,7 @@ async def _send_onboarding(chat_id: int, config: Config, context: ContextTypes.D
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "Welcome to Claude Remote!\n\n"
+            "Welcome to teleg-ode!\n\n"
             "I bridge your Telegram to Claude Code running on your machine. "
             "You can chat with Claude, browse projects, and resume terminal sessions.\n\n"
             "Let's start by picking a project:"
