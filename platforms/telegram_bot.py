@@ -603,6 +603,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if result.text:
         await _send_response(chat_id, result.text, context)
 
+    # Show tool errors that Claude may have glossed over
+    if result.tool_errors:
+        error_lines = ["Tool errors encountered:"]
+        for err in result.tool_errors:
+            error_lines.append(f"  {err.message[:300]}")
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(error_lines))
+
     if result.permission_denials:
         await _send_permission_request(
             chat_id, state.session_id, cwd, result.permission_denials, config, context
@@ -685,6 +692,12 @@ async def handle_permission_callback(update: Update, context: ContextTypes.DEFAU
     if result.text:
         await _send_response(chat_id, result.text, context)
 
+    if result.tool_errors:
+        error_lines = ["Tool errors encountered:"]
+        for err in result.tool_errors:
+            error_lines.append(f"  {err.message[:300]}")
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(error_lines))
+
     if result.permission_denials:
         await _send_permission_request(
             chat_id, session_id, working_directory,
@@ -699,6 +712,26 @@ async def _keep_typing(bot, chat_id: int) -> None:
             await asyncio.sleep(5)
     except asyncio.CancelledError:
         pass
+
+
+# ---- Error handler -----------------------------------------------------------
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and notify the user on Telegram."""
+    logger.error("Exception while handling update:", exc_info=context.error)
+
+    # Try to notify the user
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            error_msg = str(context.error)
+            if len(error_msg) > 300:
+                error_msg = error_msg[:300] + "..."
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"Error: {error_msg}",
+            )
+        except Exception:
+            pass  # Can't even send the error message
 
 
 # ---- Bot setup ---------------------------------------------------------------
@@ -731,5 +764,8 @@ def create_app(config: Config) -> Application:
 
     # Regular messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Global error handler
+    app.add_error_handler(error_handler)
 
     return app

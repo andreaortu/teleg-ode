@@ -19,9 +19,15 @@ class PermissionDenial:
 
 
 @dataclass
+class ToolError:
+    message: str
+
+
+@dataclass
 class ExecuteResult:
     text: str
     permission_denials: list[PermissionDenial] = field(default_factory=list)
+    tool_errors: list[ToolError] = field(default_factory=list)
 
 
 def _build_cmd(
@@ -97,6 +103,7 @@ async def execute(
     # Read stdout line by line (stream-json produces one JSON object per line)
     collected_text: list[str] = []
     permission_denials: list[PermissionDenial] = []
+    tool_errors: list[ToolError] = []
 
     try:
         while True:
@@ -131,6 +138,17 @@ async def execute(
                     text = delta.get("text", "")
                     if text:
                         collected_text.append(text)
+
+            elif msg_type == "user":
+                # Capture tool errors from tool_result messages
+                msg = data.get("message", {})
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("is_error"):
+                            err_content = block.get("content", "")
+                            if err_content:
+                                tool_errors.append(ToolError(message=err_content))
 
             elif msg_type == "result":
                 result_text = data.get("result", "")
@@ -168,4 +186,5 @@ async def execute(
     return ExecuteResult(
         text="".join(collected_text).strip(),
         permission_denials=permission_denials,
+        tool_errors=tool_errors,
     )
